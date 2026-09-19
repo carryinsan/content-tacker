@@ -1,0 +1,20 @@
+{
+"version": 2,
+"rewrites": [
+{
+"source": "/api/extract",
+"destination": "/api/extract.js"
+}
+],
+"headers": [
+{
+"source": "/api/extract",
+"headers": [
+{
+"key": "Access-Control-Allow-Origin",
+"value": "*"
+}
+]
+}
+]
+}
