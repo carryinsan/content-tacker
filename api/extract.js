@@ -1,179 +1,191 @@
+import * as cheerio from 'cheerio';
+
 export const config = {
-    runtime: 'edge',
+  runtime: 'edge',
 };
 
-const CRAWLER_URL = 'https://web-crawler-pink.vercel.app/api/crawler';
-const EXTRACTOR_URL = 'https://content-tacker.vercel.app/api/extract';
-
-// Increased to 28 seconds. Gives maximum time before Vercel's 30s hard limit.
-const TOTAL_TIMEOUT_MS = 28000; 
-
-const CORS_HEADERS = {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Content-Type': 'application/json'
-};
-
-// Helper: Fetch with a localized timeout so one bad request doesn't hang the loop
-async function fetchWithTimeout(resource, options = {}, timeoutMs, globalSignal) {
-    const controller = new AbortController();
-    const id = setTimeout(() => controller.abort(), timeoutMs);
-    
-    // If the global timeout fires, abort this local fetch too
-    if (globalSignal) {
-        globalSignal.addEventListener('abort', () => controller.abort());
-    }
-    
-    try {
-        const response = await fetch(resource, { ...options, signal: controller.signal });
-        clearTimeout(id);
-        return response;
-    } catch (error) {
-        clearTimeout(id);
-        throw error;
-    }
+// Bypassing IP-based rate limiting
+function getRandomIP() {
+    const validFirstOctets = [8, 12, 17, 23, 34, 45, 50, 67, 72, 80, 99, 104, 142, 168, 173, 198, 203];
+    const first = validFirstOctets[Math.floor(Math.random() * validFirstOctets.length)];
+    return `${first}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
 }
 
-// Step 1: Perform the search
-async function performSearch(query, count, signal) {
-    const targetUrl = `${CRAWLER_URL}?query=${encodeURIComponent(query)}&count=${count}`;
+// Generates perfect Chrome browser headers to bypass strict WAFs
+function getPerfectBrowserHeaders(spoofedIP, jinaKey) {
+    const headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+        'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1',
+        'Upgrade-Insecure-Requests': '1',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+        'X-Forwarded-For': spoofedIP,
+        'X-Real-IP': spoofedIP,
+        'Client-IP': spoofedIP
+    };
     
-    try {
-        // Generous 10-second timeout for the search phase
-        const res = await fetchWithTimeout(targetUrl, {
-            method: 'GET',
-            headers: { 'Accept': 'application/json' }
-        }, 10000, signal); 
-        
-        if (!res.ok) throw new Error(`Crawler API returned status: ${res.status}`);
-        const data = await res.json();
-        return data;
-    } catch (err) {
-        if (err.name === 'AbortError') throw new Error('Search phase timed out.');
-        throw err;
+    // If you add JINA_API_KEY to your Vercel Environment Variables, it bypasses the 403 entirely.
+    if (jinaKey) {
+        headers['Authorization'] = `Bearer ${jinaKey}`;
     }
+    
+    return headers;
 }
 
-// Step 2: Extract content (Delegating entirely to the robust content-tacker)
-async function extractContent(url, signal) {
-    const startTime = Date.now();
-
-    try {
-        const targetUrl = `${EXTRACTOR_URL}?url=${encodeURIComponent(url)}`;
-        
-        // Massive 25-second timeout. We let content-tacker do all the heavy lifting, 
-        // proxies, and fallbacks without interrupting it prematurely.
-        const res = await fetchWithTimeout(targetUrl, {
-            method: 'GET',
-            headers: { 'Accept': 'application/json' }
-        }, 25000, signal); 
-        
-        const data = await res.json();
-        
-        if (!data.success) {
-            return { 
-                url, 
-                success: false, 
-                content: null, 
-                error: data.error, 
-                debug: data.debug, 
-                latency: Date.now() - startTime 
-            };
-        }
-        
-        return { 
-            url, 
-            success: true, 
-            content: data.text, 
-            debug: data.debug, 
-            latency: Date.now() - startTime 
-        };
-    } catch (err) {
-        return {
-            url, 
-            success: false, 
-            content: null,
-            error: err.name === 'AbortError' ? 'Extraction timeout exceeded (Took longer than 25s).' : err.message,
-            debug: { method: "None", errors: [err.message] }, 
-            latency: Date.now() - startTime
-        };
-    }
+// Helper: Fetch with an abort timeout
+async function fetchWithTimeout(resource, options = {}) {
+  const { timeout = 8000 } = options;
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(resource, { ...options, signal: controller.signal });
+    clearTimeout(id);
+    return response;
+  } catch (error) {
+    clearTimeout(id);
+    throw error;
+  }
 }
 
 export default async function handler(req) {
-    // 1. Handle CORS Preflight Requests
-    if (req.method === 'OPTIONS') {
-        return new Response(null, { status: 204, headers: CORS_HEADERS });
-    }
+  const urlParams = new URL(req.url).searchParams;
+  const targetUrl = urlParams.get('url');
 
-    // 2. Global Abort Controller to ensure we return safely before Vercel kills the function
-    const controller = new AbortController();
-    const globalTimeoutId = setTimeout(() => controller.abort(), TOTAL_TIMEOUT_MS);
-    const startOverallTime = Date.now();
+  if (!targetUrl) {
+    return new Response(JSON.stringify({ success: false, error: "Missing URL parameter.", text: "Please provide ?url=..." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  }
 
+  try { new URL(targetUrl); } catch (e) {
+    return new Response(JSON.stringify({ success: false, error: "Invalid URL format." }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  }
+
+  let finalContent = "";
+  let methodUsed = "none";
+  let errors = [];
+
+  const spoofedIP = getRandomIP();
+  const jinaKey = process.env.JINA_API_KEY || null; 
+  const browserHeaders = getPerfectBrowserHeaders(spoofedIP, jinaKey);
+  
+  // TIER 1: The Proxy Waterfall
+  const jinaTarget = `https://r.jina.ai/${targetUrl}`;
+  const fetchStrategies = [
+      { name: "Direct Jina", url: jinaTarget },
+      { name: "CorsProxy -> Jina", url: `https://corsproxy.io/?${encodeURIComponent(jinaTarget)}` },
+      { name: "AllOrigins -> Jina", url: `https://api.allorigins.win/raw?url=${encodeURIComponent(jinaTarget)}` }
+  ];
+
+  for (const strategy of fetchStrategies) {
+      if (finalContent) break;
+      try {
+          const proxyResponse = await fetchWithTimeout(strategy.url, {
+              timeout: 6000,
+              headers: browserHeaders
+          });
+
+          if (proxyResponse.ok) {
+              const text = await proxyResponse.text();
+              // Validate that we didn't just get a proxy error page
+              if (text && text.length > 100 && !text.includes("Cloudflare") && !text.includes("403 Forbidden") && !text.includes("Access Denied")) {
+                  finalContent = text.replace(/\[.*?\]\(.*?\)/g, ''); // Clean markdown links
+                  methodUsed = `Tier 1: AI Proxy (${strategy.name})`;
+                  break;
+              } else {
+                  throw new Error(`Invalid content received via ${strategy.name}`);
+              }
+          } else {
+              throw new Error(`${strategy.name} failed with status: ${proxyResponse.status}`);
+          }
+      } catch (err) {
+          errors.push(`Tier 1 (${strategy.name}) Failed: ${err.message}`);
+      }
+  }
+
+  // TIER 2: Upgraded Semantic Markdown Scraper via Cheerio
+  if (!finalContent) {
     try {
-        let input = {};
-        if (req.method === 'POST') {
-            input = await req.json();
-        } else {
-            const urlObj = new URL(req.url);
-            input = Object.fromEntries(urlObj.searchParams.entries());
-        }
+      const rawResponse = await fetchWithTimeout(targetUrl, {
+        timeout: 8000,
+        headers: { 'User-Agent': browserHeaders['User-Agent'], 'X-Forwarded-For': spoofedIP }
+      });
 
-        const action = input.action || 'auto'; 
-        const count = parseInt(input.count || 20, 10);
-        
-        let finalPayload = { 
-            success: true, action, results: [], failed_extractions: 0, total_time_ms: 0 
-        };
+      if (!rawResponse.ok) throw new Error(`Target host returned status: ${rawResponse.status}`);
 
-        if (action === 'search' || action === 'auto') {
-            if (!input.query) throw new Error("Missing 'query' parameter.");
-            
-            const searchData = await performSearch(input.query, count, controller.signal);
-            let searchResults = searchData.results || [];
-            
-            if (action === 'search') {
-                finalPayload.results = searchResults;
-            } 
-            
-            if (action === 'auto') {
-                // Fire all extraction requests to content-tacker simultaneously
-                const extractionPromises = searchResults.map(async (res) => {
-                    const ext = await extractContent(res.url, controller.signal);
-                    if (!ext.success) finalPayload.failed_extractions++;
-                    return { ...res, extraction: ext };
-                });
-                
-                finalPayload.results = await Promise.all(extractionPromises);
-            }
-        } 
-        else if (action === 'extract') {
-            if (!input.urls || !Array.isArray(input.urls)) {
-                throw new Error("Missing 'urls' array parameter.");
-            }
-            const extractionPromises = input.urls.map(async (url) => {
-                const ext = await extractContent(url, controller.signal);
-                if (!ext.success) finalPayload.failed_extractions++;
-                return { url, extraction: ext };
-            });
-            finalPayload.results = await Promise.all(extractionPromises);
-        } else {
-            throw new Error("Invalid action. Use 'auto', 'search', or 'extract'.");
-        }
+      const html = await rawResponse.text();
+      const $ = cheerio.load(html);
 
-        clearTimeout(globalTimeoutId);
-        finalPayload.total_time_ms = Date.now() - startOverallTime;
+      // Aggressively remove bloat
+      $('script, style, noscript, iframe, img, svg, video, audio, canvas, map, object, embed, footer, header, nav, aside, [role="banner"], [role="navigation"], .ad, .ads, #comments, .comments, .sidebar, .menu').remove();
 
-        return new Response(JSON.stringify(finalPayload), { status: 200, headers: CORS_HEADERS });
+      let contentBlock = $('article').first();
+      if (contentBlock.length === 0) contentBlock = $('main').first();
+      if (contentBlock.length === 0) contentBlock = $('.main-content, #main-content, .post, .content').first();
+      if (contentBlock.length === 0) contentBlock = $('body');
 
+      let structuredText = "";
+      
+      contentBlock.find('h1, h2, h3, h4, p, li, th, td').each((i, el) => {
+          const text = $(el).text().replace(/\s+/g, ' ').trim();
+          if (text.length > 20 || $(el).is('h1, h2, h3, h4')) {
+              const tag = el.tagName.toLowerCase();
+              if (tag === 'h1' || tag === 'h2') structuredText += `\n\n## ${text}\n\n`;
+              else if (tag === 'h3' || tag === 'h4') structuredText += `\n### ${text}\n`;
+              else if (tag === 'li') structuredText += `- ${text}\n`;
+              else structuredText += `${text}\n\n`;
+          }
+      });
+
+      const cleaned = structuredText.trim();
+
+      if (cleaned.length > 200) {
+        finalContent = cleaned;
+        methodUsed = "Tier 2: Semantic Cheerio Scraper (Markdown)";
+      } else {
+        throw new Error("Semantic extraction yielded too little text. Page might be JS-only.");
+      }
     } catch (err) {
-        clearTimeout(globalTimeoutId);
-        return new Response(JSON.stringify({
-            success: false,
-            error: err.name === 'AbortError' ? 'Global timeout reached. The request was safely halted to prevent server crash.' : err.message,
-            total_time_ms: Date.now() - startOverallTime
-        }), { status: 200, headers: CORS_HEADERS });
+       errors.push(`Tier 2 Failed: ${err.message}`);
     }
+  }
+
+  // TIER 3: Raw Regex Fallback
+  if (!finalContent) {
+    try {
+      const fallbackResponse = await fetchWithTimeout(targetUrl, { timeout: 5000 });
+      let rawString = await fallbackResponse.text();
+      rawString = rawString.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '');
+      rawString = rawString.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '');
+      rawString = rawString.replace(/<[^>]+>/g, ' ');
+      const regexCleaned = rawString.replace(/\s+/g, ' ').trim();
+      
+      if (regexCleaned.length > 50) {
+        finalContent = regexCleaned;
+        methodUsed = "Tier 3: Raw Regex Fallback";
+      } else {
+        throw new Error("Regex fallback resulted in empty string.");
+      }
+    } catch (err) {
+      errors.push(`Tier 3 Failed: ${err.message}`);
+    }
+  }
+
+  // Final Output Delivery
+  if (finalContent) {
+    return new Response(JSON.stringify({ 
+      success: true, text: finalContent, debug: { method: methodUsed, errors } 
+    }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' } });
+  } else {
+    return new Response(JSON.stringify({ 
+      success: false, error: "All extraction methods failed.", 
+      text: "Failed to extract content.", debug: { method: "Failed", errors }
+    }), { status: 200, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' } });
+  }
 }
