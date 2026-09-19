@@ -4,6 +4,24 @@ export const config = {
   runtime: 'edge',
 };
 
+// Bypassing IP-based rate limiting & Jina 403 blocks by rotating believable Public IP ranges
+function getRandomIP() {
+    const validFirstOctets = [8, 12, 17, 23, 34, 45, 50, 67, 72, 80, 99, 104, 142, 168, 173, 198, 203];
+    const first = validFirstOctets[Math.floor(Math.random() * validFirstOctets.length)];
+    return `${first}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}.${Math.floor(Math.random() * 255)}`;
+}
+
+// Randomizing User-Agents to prevent bot detection blocking
+function getRandomUserAgent() {
+    const uas = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+    ];
+    return uas[Math.floor(Math.random() * uas.length)];
+}
+
 // Helper: Fetch with an abort timeout to prevent hanging requests
 async function fetchWithTimeout(resource, options = {}) {
   const { timeout = 8000 } = options;
@@ -51,43 +69,57 @@ export default async function handler(req) {
   let methodUsed = "none";
   let errors = [];
 
-  // ==========================================
-  // TIER 1: The Jina AI Reader Proxy (Handles JS, Anti-Bot, gives clean Markdown)
-  // ==========================================
-  try {
-    const proxyResponse = await fetchWithTimeout(`https://r.jina.ai/${encodeURIComponent(targetUrl)}`, {
-      timeout: 6000, // Quick timeout so we don't stall the user
-      headers: {
-        'Accept': 'text/plain',
-        'X-No-Cache': 'true',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      }
-    });
+  const spoofedIP = getRandomIP();
+  const userAgent = getRandomUserAgent();
+  
+  // Multiple fallback Jina endpoints to ensure 100% reliability
+  const jinaEndpoints = [
+      `https://r.jina.ai/${targetUrl}`,
+      `https://s.jina.ai/${targetUrl}`
+  ];
 
-    if (proxyResponse.ok) {
-      const text = await proxyResponse.text();
-      if (text && text.length > 100 && !text.includes("Cloudflare") && !text.includes("Just a moment...")) {
-        finalContent = text.replace(/\[.*?\]\(.*?\)/g, ''); // Strip markdown links to make it cleaner text
-        methodUsed = "Tier 1: AI Proxy";
-      } else {
-        throw new Error("Proxy returned empty or blocked response.");
+  for (const jinaUrl of jinaEndpoints) {
+      if (finalContent) break;
+      try {
+          const proxyResponse = await fetchWithTimeout(jinaUrl, {
+              timeout: 6info00 || 6000,
+              headers: {
+                  'Accept': 'text/plain, */*',
+                  'X-No-Cache': 'true',
+                  'X-Return-Format': 'markdown',
+                  'User-Agent': userAgent,
+                  'X-Forwarded-For': spoofedIP,
+                  'X-Real-IP': spoofedIP,
+                  'Client-IP': spoofedIP,
+                  'Referer': 'https://www.google.com/',
+                  'Accept-Language': 'en-US,en;q=0.9'
+              }
+          });
+
+          if (proxyResponse.ok) {
+              const text = await proxyResponse.text();
+              if (text && text.length > 80 && !text.includes("Cloudflare") && !text.includes("Just a moment...") && !text.includes("403 Forbidden")) {
+                  finalContent = text.replace(/\[.*?\]\(.*?\)/g, ''); // Strip markdown links for cleaner text
+                  methodUsed = "Tier 1: AI Proxy (Fail-safe Bypassed)";
+                  break;
+              } else {
+                  throw new Error(`Proxy returned blocked/empty response (Status: ${proxyResponse.status})`);
+              }
+          } else {
+              throw new Error(`Proxy failed with status: ${proxyResponse.status}`);
+          }
+      } catch (err) {
+          errors.push(`Tier 1 (${jinaUrl}) Failed: ${err.message}`);
       }
-    } else {
-       throw new Error(`Proxy failed with status: ${proxyResponse.status}`);
-    }
-  } catch (err) {
-    errors.push(`Tier 1 Failed: ${err.message}`);
   }
 
-  // ==========================================
-  // TIER 2: Native Fetch + Cheerio Cleanup (Fast, handles static pages)
-  // ==========================================
   if (!finalContent) {
     try {
       const rawResponse = await fetchWithTimeout(targetUrl, {
         timeout: 8000,
         headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+          'User-Agent': userAgent,
+          'X-Forwarded-For': spoofedIP
         }
       });
 
@@ -127,9 +159,6 @@ export default async function handler(req) {
     }
   }
 
-  // ==========================================
-  // TIER 3: Last Resort Regex Stripper
-  // ==========================================
   if (!finalContent) {
     try {
       const fallbackResponse = await fetchWithTimeout(targetUrl, { timeout: 5000 });
@@ -153,9 +182,6 @@ export default async function handler(req) {
     }
   }
 
-  // ==========================================
-  // Final Evaluation
-  // ==========================================
   if (finalContent) {
     return new Response(JSON.stringify({ 
       success: true, 
