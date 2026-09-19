@@ -82,7 +82,7 @@ export default async function handler(req) {
       if (finalContent) break;
       try {
           const proxyResponse = await fetchWithTimeout(jinaUrl, {
-              timeout: 6info00 || 6000,
+              timeout: 6000,
               headers: {
                   'Accept': 'text/plain, */*',
                   'X-No-Cache': 'true',
